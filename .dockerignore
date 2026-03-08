@@ -1,0 +1,10 @@
+data/raw/*.csv
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+venv/
+.env
+*.log
+.DS_Store

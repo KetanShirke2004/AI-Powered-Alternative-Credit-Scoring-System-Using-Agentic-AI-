@@ -1,0 +1,210 @@
+"""
+Run this as a standalone script from your project root:
+    cd credit_scoring
+    python patch_metrics_standalone.py
+
+It loads your saved models + raw data, runs OOF, computes real metrics,
+and patches ensemble_meta.json — no retraining needed.
+"""
+
+import sys, os, json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+BASE_DIR  = Path(__file__).parent         # credit_scoring/
+MODEL_DIR = BASE_DIR / "models"
+DATA_DIR  = BASE_DIR / "data" / "raw"
+META_PATH = MODEL_DIR / "ensemble_meta.json"
+
+sys.path.insert(0, str(BASE_DIR))
+
+# ── Load meta to get params & feature list ───────────────────────────────────
+print("Loading ensemble_meta.json...")
+with open(META_PATH) as f:
+    meta = json.load(f)
+
+feat_cols  = meta["feature_columns"]          # 190 features
+lgb_params = meta["lgb_params"]
+xgb_params = meta["xgb_params"]
+cb_params  = meta["cb_params"]
+cb_params["verbose"] = False
+
+print(f"  Features:  {len(feat_cols)}")
+print(f"  LGB n_est: {lgb_params['n_estimators']}")
+
+# ── Load trained models ───────────────────────────────────────────────────────
+import joblib
+from utils.named_pipeline import NamedPipeline   # must be importable
+
+print("\nLoading saved models...")
+preprocessor = joblib.load(MODEL_DIR / "preprocessor.pkl")
+meta_model   = joblib.load(MODEL_DIR / "meta_model.pkl")
+print("  ✅ preprocessor + meta_model loaded")
+
+# ── Load raw data ─────────────────────────────────────────────────────────────
+print("\nLoading application_train.csv...")
+app_path = DATA_DIR / "application_train.csv"
+if not app_path.exists():
+    print(f"❌ Not found: {app_path}")
+    print("   Place application_train.csv in credit_scoring/data/raw/")
+    sys.exit(1)
+
+df_raw = pd.read_csv(app_path)
+print(f"  Loaded {len(df_raw):,} rows")
+
+# ── Replicate the exact preprocessing from notebook ──────────────────────────
+print("\nPreprocessing...")
+
+# Label-encode categorical columns (same as Preprocessor.run in notebook)
+from sklearn.preprocessing import LabelEncoder
+cat_cols = df_raw.select_dtypes(["object"]).columns.tolist()
+le_dict  = {}
+df_enc   = df_raw.copy()
+for col in cat_cols:
+    le = LabelEncoder()
+    df_enc[col] = le.fit_transform(df_enc[col].astype(str))
+    le_dict[col] = le
+
+y = df_enc["TARGET"].values
+df_enc.drop(columns=["SK_ID_CURR", "TARGET"], inplace=True, errors="ignore")
+
+# Add engineered features that are in feat_cols but not raw columns
+# (same logic as FeatureEngineer in notebook)
+def add_engineered(df):
+    eps = 1e-6
+    df["CREDIT_INCOME_RATIO"]    = df["AMT_CREDIT"]   / (df["AMT_INCOME_TOTAL"] + eps)
+    df["ANNUITY_INCOME_RATIO"]   = df["AMT_ANNUITY"]  / (df["AMT_INCOME_TOTAL"] + eps)
+    df["CREDIT_TERM"]            = df["AMT_ANNUITY"]  / (df["AMT_CREDIT"] + eps)
+    df["INCOME_PER_PERSON"]      = df["AMT_INCOME_TOTAL"] / (df["CNT_FAM_MEMBERS"].clip(1) + eps)
+    df["GOODS_CREDIT_RATIO"]     = df["AMT_GOODS_PRICE"]  / (df["AMT_CREDIT"] + eps)
+    df["EXT_SOURCE_MEAN"]        = df[["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3"]].mean(axis=1)
+    df["EXT_SOURCE_STD"]         = df[["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3"]].std(axis=1).fillna(0)
+    df["EXT_SOURCE_PROD"]        = df["EXT_SOURCE_1"] * df["EXT_SOURCE_2"] * df["EXT_SOURCE_3"]
+    df["EXT_SOURCE_MIN"]         = df[["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3"]].min(axis=1)
+    df["EXT_SOURCE_MAX"]         = df[["EXT_SOURCE_1","EXT_SOURCE_2","EXT_SOURCE_3"]].max(axis=1)
+    df["EXT_SOURCE_1_SQ"]        = df["EXT_SOURCE_1"] ** 2
+    df["EXT_SOURCE_2_SQ"]        = df["EXT_SOURCE_2"] ** 2
+    df["EXT_SOURCE_3_SQ"]        = df["EXT_SOURCE_3"] ** 2
+    df["EXT_SOURCE_1_2_PROD"]    = df["EXT_SOURCE_1"] * df["EXT_SOURCE_2"]
+    df["EXT_SOURCE_2_3_PROD"]    = df["EXT_SOURCE_2"] * df["EXT_SOURCE_3"]
+    df["EXT_SOURCE_1_3_PROD"]    = df["EXT_SOURCE_1"] * df["EXT_SOURCE_3"]
+    df["DAYS_BIRTH_YEARS"]       = df["DAYS_BIRTH"]    / -365
+    df["DAYS_EMPLOYED_YEARS"]    = df["DAYS_EMPLOYED"].clip(upper=0) / -365
+    df["DAYS_EMPLOYED_RATIO"]    = df["DAYS_EMPLOYED"] / (df["DAYS_BIRTH"] - eps)
+    df["EMPLOYED_TO_AGE"]        = df["DAYS_EMPLOYED_YEARS"] / (df["DAYS_BIRTH_YEARS"] + eps)
+    df["AGE_SQ"]                 = df["DAYS_BIRTH_YEARS"] ** 2
+    df["EMPLOYED_SQ"]            = df["DAYS_EMPLOYED_YEARS"] ** 2
+    flag_docs = [c for c in df.columns if c.startswith("FLAG_DOCUMENT")]
+    df["DOCUMENT_COUNT"]         = df[flag_docs].sum(axis=1)
+    df["CONTACT_COUNT"]          = (df[["FLAG_MOBIL","FLAG_EMP_PHONE","FLAG_WORK_PHONE",
+                                        "FLAG_CONT_MOBILE","FLAG_PHONE","FLAG_EMAIL"]]
+                                    .sum(axis=1))
+    df["HAS_EXT_SOURCE_1"]       = df["EXT_SOURCE_1"].notna().astype(int)
+    df["HAS_EXT_SOURCE_2"]       = df["EXT_SOURCE_2"].notna().astype(int)
+    df["HAS_EXT_SOURCE_3"]       = df["EXT_SOURCE_3"].notna().astype(int)
+    return df
+
+df_enc = add_engineered(df_enc)
+
+# Align to the 190 feature columns from meta
+for col in feat_cols:
+    if col not in df_enc.columns:
+        df_enc[col] = np.nan
+df_feat = df_enc[feat_cols]
+
+# Transform through preprocessor
+print("  Transforming through preprocessor...")
+X = preprocessor.transform(df_feat)
+print(f"  X shape: {X.shape}")
+
+# ── 5-fold OOF ───────────────────────────────────────────────────────────────
+print("\nRunning 5-fold OOF (uses saved hyperparams — same as training)...")
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import roc_auc_score
+
+CV_FOLDS = 5
+kf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=42)
+oof_lgb = np.zeros(len(y))
+oof_xgb = np.zeros(len(y))
+oof_cb  = np.zeros(len(y))
+
+for fold, (tr, val) in enumerate(kf.split(X, y), 1):
+    Xtr, Xval, ytr, yval = X[tr], X[val], y[tr], y[val]
+
+    _lgb = lgb.LGBMClassifier(**lgb_params)
+    _lgb.fit(Xtr, ytr, eval_set=[(Xval, yval)],
+             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(-1)])
+    oof_lgb[val] = _lgb.predict_proba(Xval)[:, 1]
+
+    _xp = {k: v for k, v in xgb_params.items() if k != "early_stopping_rounds"}
+    _xgb = xgb.XGBClassifier(**_xp, early_stopping_rounds=50, verbosity=0)
+    _xgb.fit(Xtr, ytr, eval_set=[(Xval, yval)], verbose=False)
+    oof_xgb[val] = _xgb.predict_proba(Xval)[:, 1]
+
+    _cbp = {k: v for k, v in cb_params.items()}
+    _cb = CatBoostClassifier(**_cbp)
+    _cb.fit(Xtr, ytr, eval_set=(Xval, yval), early_stopping_rounds=50, verbose=False)
+    oof_cb[val] = _cb.predict_proba(Xval)[:, 1]
+
+    lgb_auc = roc_auc_score(yval, oof_lgb[val])
+    xgb_auc = roc_auc_score(yval, oof_xgb[val])
+    cb_auc  = roc_auc_score(yval, oof_cb[val])
+    print(f"  Fold {fold}: LGB={lgb_auc:.4f}  XGB={xgb_auc:.4f}  CB={cb_auc:.4f}")
+
+# Stack through meta-model
+oof_stack = np.column_stack([oof_lgb, oof_xgb, oof_cb])
+oof_final = meta_model.predict_proba(oof_stack)[:, 1]
+final_auc = roc_auc_score(y, oof_final)
+
+# ── Compute real metrics ──────────────────────────────────────────────────────
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                              f1_score, brier_score_loss, average_precision_score,
+                              log_loss as sklearn_log_loss, roc_curve)
+from scipy.stats import ks_2samp
+
+fpr_arr, tpr_arr, thr_arr = roc_curve(y, oof_final)
+best_thr = float(thr_arr[np.argmax(tpr_arr - fpr_arr)])
+oof_pred = (oof_final >= best_thr).astype(int)
+
+real_metrics = {
+    "ensemble_oof_auc": round(float(final_auc), 4),
+    "accuracy":         round(float(accuracy_score(y, oof_pred)), 4),
+    "precision":        round(float(precision_score(y, oof_pred, zero_division=0)), 4),
+    "recall":           round(float(recall_score(y, oof_pred, zero_division=0)), 4),
+    "f1":               round(float(f1_score(y, oof_pred, zero_division=0)), 4),
+    "brier_score":      round(float(brier_score_loss(y, oof_final)), 4),
+    "log_loss":         round(float(sklearn_log_loss(y, oof_final)), 4),
+    "auc_pr":           round(float(average_precision_score(y, oof_final)), 4),
+    "gini":             round(float(2 * final_auc - 1), 4),
+    "ks_stat":          round(float(ks_2samp(oof_final[y==1], oof_final[y==0])[0]), 4),
+    "positive_rate":    round(float(np.mean(y)), 4),
+    "best_threshold":   round(float(best_thr), 4),
+    "train_samples":    int(len(y)),
+}
+
+print(f"\n{'='*45}")
+print(f"  OOF AUC:         {real_metrics['ensemble_oof_auc']:.4f}")
+print(f"  Accuracy:        {real_metrics['accuracy']:.4f}")
+print(f"  Precision:       {real_metrics['precision']:.4f}")
+print(f"  Recall:          {real_metrics['recall']:.4f}")
+print(f"  F1 Score:        {real_metrics['f1']:.4f}")
+print(f"  Gini:            {real_metrics['gini']:.4f}")
+print(f"  KS Statistic:    {real_metrics['ks_stat']:.4f}")
+print(f"  AUC-PR:          {real_metrics['auc_pr']:.4f}")
+print(f"  Brier Score:     {real_metrics['brier_score']:.4f}")
+print(f"  Positive Rate:   {real_metrics['positive_rate']:.4f}")
+print(f"  Best Threshold:  {real_metrics['best_threshold']:.4f}")
+print(f"{'='*45}")
+
+# ── Patch ensemble_meta.json ──────────────────────────────────────────────────
+meta["metrics"].update(real_metrics)
+with open(META_PATH, "w") as f:
+    json.dump(meta, f, indent=2)
+
+print(f"\n✅ ensemble_meta.json patched at:\n   {META_PATH}")
+print("   Restart Streamlit — dashboard will show real metrics.")
